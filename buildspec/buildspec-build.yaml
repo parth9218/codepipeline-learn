@@ -53,6 +53,11 @@ phases:
       # Using an absolute path eliminates any subtle path resolution issues.
       - cd infra && npm run synth -- --context stackName=hello-api-stack -o $CODEBUILD_SRC_DIR/cdk.out
       - cd $CODEBUILD_SRC_DIR && ls -la cdk.out/
+      
+      # Publish the generated CDK assets to S3 so that the subsequent Deploy
+      # stage doesn't fail with NoSuchKey when CloudFormation looks for the Zip file.
+      - echo "Publishing CDK assets to S3..."
+      - cd infra && npx --yes cdk-assets publish -p $CODEBUILD_SRC_DIR/cdk.out/ApiStack.assets.json -v
 
   post_build:
     commands:

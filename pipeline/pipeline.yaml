@@ -241,6 +241,11 @@ Resources:
               - Effect: Allow
                 Action: sts:GetCallerIdentity
                 Resource: "*"
+                
+              # STS — Allow assuming CDK bootstrap roles for asset publishing (e.g. file-publishing-role)
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/cdk-hnb659fds-*-role-${AWS::AccountId}-${AWS::Region}"
 
               # CloudFormation — deploy/describe/delete the ephemeral test stack
               - Effect: Allow
