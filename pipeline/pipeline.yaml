@@ -164,12 +164,21 @@ Resources:
                   - apigateway:OPTIONS
                 Resource: !Sub "arn:aws:apigateway:${AWS::Region}::/*"
 
-              # S3 — CloudFormation reads the Lambda asset ZIP from the artifact bucket
+              # S3 — CloudFormation reads the Lambda asset ZIP from the artifact bucket and CDK asset bucket
               - Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:GetObjectVersion
-                Resource: !Sub "${ArtifactBucket.Arn}/*"
+                Resource: 
+                  - !Sub "${ArtifactBucket.Arn}/*"
+                  - !Sub "arn:aws:s3:::cdk-*-assets-${AWS::AccountId}-${AWS::Region}/*"
+
+              # SSM — CDK requires reading the bootstrap version parameter
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/*"
 
               # CloudWatch Logs — API Gateway logs to CloudWatch
               - Effect: Allow
