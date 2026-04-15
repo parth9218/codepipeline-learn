@@ -44,23 +44,17 @@ phases:
       - echo "──────────────────────────────────────────────────"
       - echo "  Step 1 — Compile TypeScript → app/dist/"
       - echo "──────────────────────────────────────────────────"
+      # Each list item is its own shell invocation — failure stops the build.
       - npm run build --prefix app
-      - echo "Compiled output:"
       - ls -la app/dist/
 
       - echo "──────────────────────────────────────────────────"
       - echo "  Step 2 — CDK Synth → cdk.out/"
       - echo "──────────────────────────────────────────────────"
-      # --output ../cdk.out places the template at the repo root so all
-      # subsequent stages find it at a predictable path regardless of cwd.
-      - |
-        cd infra
-        npx cdk synth \
-          --output ../cdk.out \
-          --context stackName=hello-api-stack \
-          --quiet
-        cd ..
-      - echo "Synthesised templates:"
+      # Using && ensures that if cdk synth fails the non-zero exit is
+      # immediately returned to CodeBuild. A trailing cd .. in a | block
+      # would silently swallow the error by returning exit 0.
+      - cd infra && npx cdk synth --output ../cdk.out --context stackName=hello-api-stack --quiet
       - ls -la cdk.out/
 
   post_build:
