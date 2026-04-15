@@ -1,0 +1,13 @@
+{
+  "name": "hello-api-app",
+  "version": "1.0.0",
+  "description": "TypeScript Lambda handler for the Hello API",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.140",
+    "typescript": "^5.4.5"
+  }
+}

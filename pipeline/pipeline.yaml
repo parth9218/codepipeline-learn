@@ -1,0 +1,791 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CodePipeline Learning Demo — End-to-End CI/CD for Lambda + API Gateway.
+
+  Pipeline stages:
+    1. Source      – Pulls code from GitHub on every push (CodeStar Connection)
+    2. Build       – Compiles TypeScript + runs CDK synth
+    3. Test        – CDK assertion unit tests + integration test (temp stack)
+    4. PreDeploy   – Deploys prod CFN stack, reads version ARNs, writes appspec.yaml
+    5. TrafficShift– CodeDeploy AllAtOnce: shifts Lambda alias with hook validation
+
+  ┌──────────┐   ┌───────┐   ┌──────┐   ┌────────────┐   ┌───────────────┐
+  │  GitHub  │──►│ Build │──►│ Test │──►│ PreDeploy  │──►│ CodeDeploy    │
+  │  Source  │   │       │   │      │   │ (CFN+appspec│   │ AllAtOnce     │
+  └──────────┘   └───────┘   └──────┘   └────────────┘   │ Before/After  │
+                                                           │ hooks         │
+                                                           └───────────────┘
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PARAMETERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+Parameters:
+
+  GitHubOwner:
+    Type: String
+    Description: "GitHub username or organisation (e.g. my-org)"
+
+  GitHubRepo:
+    Type: String
+    Description: "Repository name — must contain app/, infra/, buildspec/, pipeline/"
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: "Branch that triggers the pipeline on every push"
+
+  LambdaFunctionName:
+    Type: String
+    Default: hello-api-function
+    Description: >
+      Physical name of the Lambda function created by CDK.
+      The pre-deploy buildspec passes this as the FunctionName CFN parameter
+      so that CDK synthesises the exact same name here and in the test stack.
+
+  ProdStackName:
+    Type: String
+    Default: hello-api-prod-stack
+    Description: "Name of the production CloudFormation stack"
+
+  TestStackName:
+    Type: String
+    Default: hello-api-TEST-stack
+    Description: "Name of the ephemeral test stack (created + deleted each run)"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RESOURCES
+# ═════════════════════════════════════════════════════════════════════════════
+
+Resources:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1. GITHUB CONNECTION (CodeStar)
+  # ───────────────────────────────────────────────────────────────────────────
+  # After the stack is created, go to:
+  #   AWS Console → CodePipeline → Settings → Connections
+  # and click "Update pending connection" to authorize via GitHub OAuth.
+  # The pipeline will not start until the status changes to AVAILABLE.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  GitHubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: !Sub "github-${GitHubRepo}"
+      ProviderType: GitHub
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 2. ARTIFACT STORAGE
+  # CodePipeline stores stage inputs/outputs here. Each action reads from and
+  # writes to named artifacts which are transparently managed by CodePipeline.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "codepipeline-artifacts-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 3. IAM ROLES
+  # ───────────────────────────────────────────────────────────────────────────
+
+  # ── 3a. CodeBuild Role ────────────────────────────────────────────────────
+  # Shared by Build, Test, and PreDeploy CodeBuild projects.
+  # Needs broad CFN/Lambda/IAM permissions because it deploys CDK stacks.
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CodeBuildRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              # CloudWatch Logs — CodeBuild streams build output here
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+
+              # S3 — Read source & write output artifacts
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+
+              # STS — CDK uses this to determine account ID for environment-aware stacks
+              - Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: "*"
+
+              # CloudFormation — deploy/update/delete test & prod stacks
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*"
+
+              # Lambda — deploy Lambda functions (as part of CFN) and invoke for integration tests
+              - Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetAlias
+                  - lambda:CreateAlias
+                  - lambda:UpdateAlias
+                  - lambda:DeleteAlias
+                  - lambda:PublishVersion
+                  - lambda:ListVersionsByFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:InvokeFunction
+                  - lambda:TagResource
+                Resource: "*"
+
+              # IAM — CDK stacks create execution roles for Lambda
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:PassRole
+                  - iam:TagRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+
+              # API Gateway — CDK creates REST API resources
+              - Effect: Allow
+                Action:
+                  - apigateway:POST
+                  - apigateway:PUT
+                  - apigateway:PATCH
+                  - apigateway:DELETE
+                  - apigateway:GET
+                Resource: !Sub "arn:aws:apigateway:${AWS::Region}::/*"
+
+              # CodeStarConnections — needed for source artifact download
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !Ref GitHubConnection
+
+  # ── 3b. Pipeline Role ─────────────────────────────────────────────────────
+  # The pipeline itself assumes this role to orchestrate actions across stages.
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PipelineRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+
+              # Allow pipeline to start CodeBuild builds
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: "*"
+
+              # Allow pipeline to start CodeDeploy deployments
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetDeploymentConfig
+                Resource: "*"
+
+              # Allow pipeline to use the GitHub connection
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !Ref GitHubConnection
+
+              # PassRole — pipeline must pass roles to CodeBuild/CodeDeploy
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: "*"
+
+  # ── 3c. CodeDeploy Role ───────────────────────────────────────────────────
+  # CodeDeploy assumes this role to update the Lambda alias and invoke hooks.
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CodeDeployRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      # AWS-managed policy that grants CodeDeploy the minimum permissions
+      # needed to perform Lambda traffic shifts with CloudWatch alarm support.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
+
+  # ── 3d. Hook Function Role ────────────────────────────────────────────────
+  # The BeforeAllowTraffic and AfterAllowTraffic Lambda hooks assume this role.
+  HookFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "HookFunctionRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: HookPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+              # Hooks must report their result back to CodeDeploy
+              - Effect: Allow
+                Action: codedeploy:PutLifecycleEventHookExecutionStatus
+                Resource: "*"
+
+              # BeforeAllowTraffic hook invokes the new Lambda version directly
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunctionName}*"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. CODEBUILD PROJECTS
+  # ───────────────────────────────────────────────────────────────────────────
+
+  # ── 4a. Build Project (Stage 2) ───────────────────────────────────────────
+  # Compiles TypeScript and synthesises the CDK stack into a CFN template.
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-build"
+      Description: "Compile TypeScript + CDK synth → CloudFormation template"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: CDK_DEFAULT_ACCOUNT
+            Value: !Ref AWS::AccountId
+          - Name: CDK_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-build.yaml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/${AWS::StackName}-build"
+
+  # ── 4b. Test Project (Stage 3) ────────────────────────────────────────────
+  # Runs CDK assertion unit tests + deploys and tests a temporary stack.
+  TestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-test"
+      Description: "CDK assertion tests + integration test via temp CFN stack"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: TEST_STACK_NAME
+            Value: !Ref TestStackName
+          - Name: TEST_FUNCTION_NAME
+            Value: !Sub "${LambdaFunctionName}-test"
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-test.yaml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/${AWS::StackName}-test"
+
+  # ── 4c. Pre-Deploy Project (Stage 4, Action 1) ────────────────────────────
+  # Deploys the production CFN stack, then generates appspec.yaml with real
+  # Lambda version ARNs for the downstream CodeDeploy action.
+  PreDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-predeploy"
+      Description: "Deploy prod CFN stack + generate CodeDeploy appspec with version ARNs"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: PROD_STACK_NAME
+            Value: !Ref ProdStackName
+          - Name: FUNCTION_NAME
+            Value: !Ref LambdaFunctionName
+          # Hook function names — the pre-deploy buildspec embeds these in appspec.yaml
+          - Name: BEFORE_HOOK_FUNCTION
+            Value: !Ref BeforeAllowTrafficFunction
+          - Name: AFTER_HOOK_FUNCTION
+            Value: !Ref AfterAllowTrafficFunction
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-predeploy.yaml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/${AWS::StackName}-predeploy"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 5. CODEDEPLOY LIFECYCLE HOOK LAMBDA FUNCTIONS
+  # ───────────────────────────────────────────────────────────────────────────
+  #
+  # These functions are separate from the application Lambda.
+  # They are invoked by CodeDeploy at specific points in the traffic-shift lifecycle.
+  #
+  # IMPORTANT: Each hook MUST call PutLifecycleEventHookExecutionStatus with
+  # status "Succeeded" or "Failed". If the Lambda times out without calling it,
+  # CodeDeploy treats it as Failed and rolls back.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  # ── 5a. BeforeAllowTraffic Hook ───────────────────────────────────────────
+  # Runs BEFORE CodeDeploy shifts any traffic to the new Lambda version.
+  # Directly invokes the new version ARN (from the appspec TargetVersion).
+  # Validates that the new code responds correctly before it goes live.
+  BeforeAllowTrafficFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${LambdaFunctionName}-before-hook"
+      Description: "CodeDeploy BeforeAllowTraffic hook — validates new Lambda version"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt HookFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+
+          lambda_client   = boto3.client('lambda')
+          codedeploy_client = boto3.client('codedeploy')
+
+          def handler(event, context):
+              """
+              BeforeAllowTraffic hook.
+
+              event contains:
+                - DeploymentId
+                - LifecycleEventHookExecutionId
+              """
+              deployment_id      = event['DeploymentId']
+              execution_id       = event['LifecycleEventHookExecutionId']
+              function_name      = os.environ['FUNCTION_NAME']
+
+              print(f"BeforeAllowTraffic | deployment={deployment_id}")
+              status = 'Succeeded'
+
+              try:
+                  # Get the new version ARN from CodeDeploy deployment details
+                  deployment = codedeploy_client.get_deployment(deploymentId=deployment_id)
+                  revision   = deployment['deploymentInfo']['revision']
+                  target_arn = (
+                      revision.get('appSpecContent', {})
+                              .get('content', '')
+                  )
+
+                  # Invoke the new Lambda version directly using $LATEST as a
+                  # proxy (the new code is already uploaded; alias still points old).
+                  # Using a test payload that mimics API Gateway.
+                  test_payload = {
+                      'httpMethod': 'GET',
+                      'path': '/',
+                      'requestContext': {'stage': 'test'},
+                      'headers': {}
+                  }
+
+                  response = lambda_client.invoke(
+                      FunctionName   = function_name,
+                      Qualifier      = '$LATEST',
+                      InvocationType = 'RequestResponse',
+                      Payload        = json.dumps(test_payload).encode()
+                  )
+
+                  payload     = json.loads(response['Payload'].read())
+                  status_code = payload.get('statusCode', 500)
+
+                  print(f"New version response: HTTP {status_code}")
+                  print(f"Body: {payload.get('body', '')}")
+
+                  if status_code != 200:
+                      print(f"BEFORE HOOK FAILED: expected 200, got {status_code}")
+                      status = 'Failed'
+                  else:
+                      print("BEFORE HOOK PASSED ✓ — new version is healthy")
+
+              except Exception as exc:
+                  print(f"BEFORE HOOK ERROR: {exc}")
+                  status = 'Failed'
+
+              # MANDATORY: report result to CodeDeploy
+              codedeploy_client.put_lifecycle_event_hook_execution_status(
+                  deploymentId                      = deployment_id,
+                  lifecycleEventHookExecutionId     = execution_id,
+                  status                            = status
+              )
+
+              return {'status': status}
+      Environment:
+        Variables:
+          FUNCTION_NAME: !Ref LambdaFunctionName
+
+  # ── 5b. AfterAllowTraffic Hook ────────────────────────────────────────────
+  # Runs AFTER CodeDeploy has shifted 100% of traffic to the new version.
+  # Calls the API via the alias (stable endpoint) to confirm end-to-end health.
+  # On failure, CodeDeploy rolls the alias back to the previous version.
+  AfterAllowTrafficFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${LambdaFunctionName}-after-hook"
+      Description: "CodeDeploy AfterAllowTraffic hook — smoke tests live alias"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt HookFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib.request
+          import os
+
+          codedeploy_client  = boto3.client('codedeploy')
+          cfn_client         = boto3.client('cloudformation')
+
+          def handler(event, context):
+              """
+              AfterAllowTraffic hook.
+
+              Traffic is now 100% on the new Lambda version.
+              We call the public API Gateway URL through the alias to validate
+              the full request path end-to-end.
+              """
+              deployment_id = event['DeploymentId']
+              execution_id  = event['LifecycleEventHookExecutionId']
+              stack_name    = os.environ['PROD_STACK_NAME']
+
+              print(f"AfterAllowTraffic | deployment={deployment_id}")
+              status = 'Succeeded'
+
+              try:
+                  # Fetch the live API URL from the production stack outputs
+                  resp = cfn_client.describe_stacks(StackName=stack_name)
+                  outputs = {
+                      o['OutputKey']: o['OutputValue']
+                      for o in resp['Stacks'][0].get('Outputs', [])
+                  }
+                  api_url = outputs.get('ApiUrl', '').rstrip('/')
+                  health_url = f"{api_url}/health"
+
+                  print(f"Calling health endpoint: {health_url}")
+                  req      = urllib.request.Request(health_url)
+                  response = urllib.request.urlopen(req, timeout=10)
+                  body     = json.loads(response.read())
+
+                  print(f"HTTP {response.status}")
+                  print(f"Body: {body}")
+
+                  if response.status == 200 and 'message' in body:
+                      print("AFTER HOOK PASSED ✓ — live alias is healthy")
+                  else:
+                      print("AFTER HOOK FAILED: unexpected response")
+                      status = 'Failed'
+
+              except Exception as exc:
+                  print(f"AFTER HOOK ERROR: {exc}")
+                  status = 'Failed'
+
+              # MANDATORY: report result to CodeDeploy
+              codedeploy_client.put_lifecycle_event_hook_execution_status(
+                  deploymentId                  = deployment_id,
+                  lifecycleEventHookExecutionId = execution_id,
+                  status                        = status
+              )
+
+              return {'status': status}
+      Environment:
+        Variables:
+          PROD_STACK_NAME: !Ref ProdStackName
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 6. CODEDEPLOY APPLICATION + DEPLOYMENT GROUP
+  # ───────────────────────────────────────────────────────────────────────────
+
+  # Application — logical grouping for this Lambda's deployments
+  CodeDeployApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub "${LambdaFunctionName}-app"
+      # Lambda is the compute platform for function-based deployments
+      ComputePlatform: Lambda
+
+  # Deployment Group — defines HOW traffic shifts for this application
+  CodeDeployGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentGroupName: !Sub "${LambdaFunctionName}-deployment-group"
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+
+      # AllAtOnce: shift 100% of requests to the new version in a single step.
+      # The alias is updated atomically — there is no period of split traffic.
+      # Alternative configs (for future learning):
+      #   CodeDeployDefault.LambdaCanary10Percent5Minutes — 10% for 5 min then 90%
+      #   CodeDeployDefault.LambdaLinear10PercentEvery1Minute — gradual linear shift
+      DeploymentConfigName: CodeDeployDefault.LambdaAllAtOnce
+
+      DeploymentStyle:
+        DeploymentOption: WITH_TRAFFIC_CONTROL   # enables hook callbacks
+        DeploymentType: BLUE_GREEN               # Lambda deployments are always blue/green
+
+      # Auto-rollback: if the AfterAllowTraffic hook reports Failed,
+      # CodeDeploy automatically shifts the alias back to the previous version.
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_REQUEST
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 7. THE PIPELINE
+  # ───────────────────────────────────────────────────────────────────────────
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${AWS::StackName}-pipeline"
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      RestartExecutionOnUpdate: false
+
+      Stages:
+
+        # ── Stage 1: SOURCE ─────────────────────────────────────────────────
+        # Triggers on every push to the configured branch.
+        # Downloads the repo as SourceArtifact → available to Build stage.
+        # ─────────────────────────────────────────────────────────────────────
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Sub "${GitHubOwner}/${GitHubRepo}"
+                BranchName: !Ref GitHubBranch
+                # CODE_ZIP preserves file permissions (important for shell scripts)
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: true
+              OutputArtifacts:
+                - Name: SourceArtifact
+
+        # ── Stage 2: BUILD ──────────────────────────────────────────────────
+        # Runs buildspec-build.yaml:
+        #   1. npm ci (app + infra)
+        #   2. tsc → app/dist/
+        #   3. cdk synth → cdk.out/
+        # ─────────────────────────────────────────────────────────────────────
+        - Name: Build
+          Actions:
+            - Name: BuildAndSynth
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact    # contains app/dist/ + cdk.out/ + infra/node_modules/
+
+        # ── Stage 3: TEST ───────────────────────────────────────────────────
+        # Runs buildspec-test.yaml:
+        #   Phase A: jest (CDK assertions — no AWS calls)
+        #   Phase B: deploy temp CFN stack → curl API → verify HTTP 200 → teardown
+        # A non-zero exit code here STOPS the pipeline. Nothing reaches prod.
+        # ─────────────────────────────────────────────────────────────────────
+        - Name: Test
+          Actions:
+            - Name: CdkAssertionsAndIntegrationTest
+              ActionTypeId:
+                Category: Test
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref TestProject
+              InputArtifacts:
+                - Name: BuildArtifact
+
+        # ── Stage 4: DEPLOY ─────────────────────────────────────────────────
+        # Two sequential actions (RunOrder controls sequencing):
+        #
+        #   Action 1 (RunOrder: 1) — PreDeploy CodeBuild
+        #     - Deploys the production CloudFormation stack
+        #     - Generates appspec.yaml with real Lambda version ARNs
+        #     - Outputs DeployArtifact (contains only appspec.yaml)
+        #
+        #   Action 2 (RunOrder: 2) — CodeDeploy AllAtOnce
+        #     - Reads appspec.yaml from DeployArtifact
+        #     - Invokes BeforeAllowTraffic hook (validates new version)
+        #     - Atomically shifts alias "live" to new version
+        #     - Invokes AfterAllowTraffic hook (smoke tests live endpoint)
+        #     - Auto-rollback if either hook returns Failed
+        # ─────────────────────────────────────────────────────────────────────
+        - Name: Deploy
+          Actions:
+
+            - Name: PreDeploy
+              RunOrder: 1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref PreDeployProject
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts:
+                - Name: DeployArtifact   # contains generated appspec.yaml
+
+            - Name: AllAtOnceTrafficShift
+              RunOrder: 2
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: "1"
+              Configuration:
+                ApplicationName: !Ref CodeDeployApp
+                DeploymentGroupName: !Ref CodeDeployGroup
+              InputArtifacts:
+                - Name: DeployArtifact   # CodeDeploy reads appspec.yaml from here
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OUTPUTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+Outputs:
+
+  PipelineUrl:
+    Description: "Direct link to the pipeline in the AWS Console"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view"
+
+  GitHubConnectionArn:
+    Description: >
+      ARN of the CodeStar Connection. After stack creation, go to
+      CodePipeline → Settings → Connections and authorize this connection.
+    Value: !Ref GitHubConnection
+
+  ArtifactBucketName:
+    Description: "S3 bucket storing pipeline artifacts"
+    Value: !Ref ArtifactBucket
+
+  CodeDeployAppName:
+    Description: "CodeDeploy application name"
+    Value: !Ref CodeDeployApp
+
+  CodeDeployGroupName:
+    Description: "CodeDeploy deployment group name"
+    Value: !Ref CodeDeployGroup

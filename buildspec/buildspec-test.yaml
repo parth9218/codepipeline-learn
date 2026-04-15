@@ -1,0 +1,123 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST STAGE — buildspec-test.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This buildspec runs in the CodePipeline TEST stage.
+# Input: BuildArtifact (compiled app/dist/ + cdk.out/ + infra/node_modules/)
+#
+# Two test phases:
+#
+#   Phase A — CDK Assertion Unit Tests (aws-cdk-lib/assertions)
+#     Verifies the synthesised CloudFormation template (cdk.out/ApiStack.template.json)
+#     contains the expected resources with correct properties.
+#     No AWS credentials or real deployment needed — purely template inspection.
+#
+#   Phase B — Integration Test (deploy → verify → teardown)
+#     1. Deploys the synthesised CFN template to a *temporary* test stack.
+#     2. Calls the live API endpoint (GET /) and asserts HTTP 200.
+#     3. Deletes the test stack (always, even on failure via finally pattern).
+#
+# If any phase fails, CodeBuild exits non-zero → CodePipeline marks the stage
+# FAILED and halts progression — the broken build never reaches production.
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: 0.2
+
+env:
+  variables:
+    TEST_STACK_NAME: "hello-api-TEST-stack"
+    TEST_FUNCTION_NAME: "hello-api-function-test"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - echo "Installing infra node_modules for Jest..."
+      - npm ci --prefix infra
+
+  pre_build:
+    commands:
+      - echo "══════════════════════════════════════════════════"
+      - echo "  PHASE A — CDK Assertion Unit Tests"
+      - echo "══════════════════════════════════════════════════"
+      # Jest reads infra/test/api-stack.test.ts and uses aws-cdk-lib/assertions
+      # to parse cdk.out/ApiStack.template.json in-memory — no AWS calls.
+      - npm test --prefix infra
+      - echo "CDK assertion tests PASSED ✓"
+
+  build:
+    commands:
+      - echo "══════════════════════════════════════════════════"
+      - echo "  PHASE B — Integration Test (temp stack)"
+      - echo "══════════════════════════════════════════════════"
+
+      - echo "─── Deploying temporary test stack ───"
+      - |
+        aws cloudformation deploy \
+          --template-file cdk.out/ApiStack.template.json \
+          --stack-name "$TEST_STACK_NAME" \
+          --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+          --parameter-overrides FunctionName="$TEST_FUNCTION_NAME" \
+          --no-fail-on-empty-changeset
+
+      - echo "─── Fetching test stack outputs ───"
+      - |
+        API_URL=$(aws cloudformation describe-stacks \
+          --stack-name "$TEST_STACK_NAME" \
+          --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
+          --output text)
+        echo "API URL: $API_URL"
+        echo "API_URL=$API_URL" >> /tmp/test_env
+
+      - echo "─── Calling GET / (expect HTTP 200) ───"
+      - |
+        source /tmp/test_env
+
+        # Retry up to 5 times to allow API Gateway/Lambda cold start
+        for i in 1 2 3 4 5; do
+          HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" "${API_URL}")
+          echo "Attempt $i → HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ]; then break; fi
+          sleep 5
+        done
+
+        echo "Response body:"
+        cat /tmp/response.json
+        echo ""
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "INTEGRATION TEST FAILED: expected HTTP 200, got $HTTP_CODE"
+          # Clean up before failing
+          aws cloudformation delete-stack --stack-name "$TEST_STACK_NAME" || true
+          exit 1
+        fi
+
+        echo "Integration test PASSED ✓"
+
+      - echo "─── Verifying JSON response shape ───"
+      - |
+        # Validate the response contains expected keys using python (always available)
+        python3 -c "
+        import json, sys
+        body = json.load(open('/tmp/response.json'))
+        required = ['message', 'version', 'timestamp', 'requestId']
+        missing = [k for k in required if k not in body]
+        if missing:
+            print(f'FAILED: missing keys {missing}')
+            sys.exit(1)
+        print('Response shape valid ✓')
+        print(f'  message   : {body[\"message\"]}')
+        print(f'  version   : {body[\"version\"]}')
+        print(f'  requestId : {body[\"requestId\"]}')
+        "
+
+  post_build:
+    commands:
+      - echo "─── Deleting temporary test stack ───"
+      - |
+        aws cloudformation delete-stack --stack-name "$TEST_STACK_NAME" || true
+        # Wait for deletion in background (non-blocking) — don't hold up the pipeline
+        aws cloudformation wait stack-delete-complete --stack-name "$TEST_STACK_NAME" &
+        echo "Test stack teardown initiated ✓"
+      - echo "Test stage complete ✓"

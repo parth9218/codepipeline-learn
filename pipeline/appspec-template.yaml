@@ -1,0 +1,49 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# appspec-template.yaml  — static reference / educational copy
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This file is for DOCUMENTATION PURPOSES ONLY. The real appspec used by
+# CodeDeploy is generated dynamically by buildspec-predeploy.yaml with the
+# actual Lambda version ARNs resolved from CloudFormation stack outputs.
+#
+# AppSpec format for Lambda deployments:
+#   https://docs.aws.amazon.com/codedeploy/latest/userguide/reference-appspec-file.html
+#
+# Traffic shift lifecycle:
+#
+#   ┌─────────────────────────────────────────────────────────────────┐
+#   │  1. CodeDeploy reads appspec.yaml from the DeployArtifact        │
+#   │  2. Invokes BeforeAllowTraffic hook — validates new version      │
+#   │     Hook MUST call PutLifecycleEventHookExecutionStatus(Succeeded)│
+#   │  3. Shifts alias from CurrentVersion → TargetVersion (AllAtOnce) │
+#   │  4. Invokes AfterAllowTraffic hook — smoke tests live alias      │
+#   │  5. If any hook returns Failed → CodeDeploy auto-rollback        │
+#   └─────────────────────────────────────────────────────────────────┘
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: 0.0
+
+Resources:
+  - HelloFunction:
+      Type: AWS::Lambda::Function
+      Properties:
+        # Physical name of the Lambda function
+        Name: "hello-api-function"
+        # The alias that API Gateway calls; CodeDeploy atomically updates this
+        Alias: "live"
+        # Version currently receiving 100% of traffic (before this deployment)
+        CurrentVersion: "arn:aws:lambda:us-east-1:123456789012:function:hello-api-function:3"
+        # New version to shift traffic to
+        TargetVersion:  "arn:aws:lambda:us-east-1:123456789012:function:hello-api-function:4"
+
+Hooks:
+  # Lambda function invoked BEFORE traffic shifts to TargetVersion.
+  # It receives the new version ARN and must confirm it works correctly.
+  # On failure → CodeDeploy stops and rolls back (alias stays on CurrentVersion).
+  - BeforeAllowTraffic: "hello-api-before-traffic-hook"
+
+  # Lambda function invoked AFTER traffic shifts (alias now points to TargetVersion).
+  # It should smoke-test the live endpoint through the alias.
+  # On failure → CodeDeploy rolls alias back to CurrentVersion.
+  - AfterAllowTraffic:  "hello-api-after-traffic-hook"

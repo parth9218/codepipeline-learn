@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD STAGE — buildspec-build.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This buildspec runs in the CodePipeline BUILD stage.
+#
+# Responsibilities:
+#   1. Install Node.js dependencies for both app/ and infra/
+#   2. Compile the TypeScript Lambda handler  →  app/dist/
+#   3. Run `cdk synth` to generate the CloudFormation template → cdk.out/
+#
+# Output artifact contains the entire workspace so downstream stages
+# (Test, Deploy) have access to:
+#   - app/dist/            compiled Lambda code
+#   - cdk.out/             synthesised CloudFormation template
+#   - infra/node_modules/  needed to run Jest assertion tests
+#   - buildspec/           other buildspecs (referenced by CodeBuild projects)
+#   - pipeline/            appspec template
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: 0.2
+
+env:
+  variables:
+    # These are also injected by the CodeBuild project definition in pipeline.yaml
+    # so that CDK knows which account/region to target when synthesizing.
+    CDK_DEFAULT_REGION: "us-east-1"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - echo "──────────────────────────────────────────────────"
+      - echo "  Installing dependencies"
+      - echo "──────────────────────────────────────────────────"
+      # Install app dependencies (TypeScript, @types/aws-lambda)
+      - npm ci --prefix app
+      # Install CDK + jest + constructs
+      - npm ci --prefix infra
+
+  build:
+    commands:
+      - echo "──────────────────────────────────────────────────"
+      - echo "  Step 1 — Compile TypeScript → app/dist/"
+      - echo "──────────────────────────────────────────────────"
+      - npm run build --prefix app
+      - echo "Compiled output:"
+      - ls -la app/dist/
+
+      - echo "──────────────────────────────────────────────────"
+      - echo "  Step 2 — CDK Synth → cdk.out/"
+      - echo "──────────────────────────────────────────────────"
+      # --output ../cdk.out places the template at the repo root so all
+      # subsequent stages find it at a predictable path regardless of cwd.
+      - |
+        cd infra
+        npx cdk synth \
+          --output ../cdk.out \
+          --context stackName=hello-api-stack \
+          --quiet
+        cd ..
+      - echo "Synthesised templates:"
+      - ls -la cdk.out/
+
+  post_build:
+    commands:
+      - echo "Build stage complete ✓"
+
+# Pass the entire workspace as the pipeline artifact.
+# CodePipeline zips this and stores it in the artifact S3 bucket.
+# Downstream stages receive an unzipped copy of exactly this tree.
+artifacts:
+  files:
+    - "**/*"
+  base-directory: "."
