@@ -538,9 +538,9 @@ Resources:
                 ActionMode: CHANGE_SET_REPLACE
                 StackName: !Ref ProdStackName
                 ChangeSetName: !Sub "${ProdStackName}-changeset"
-                # infra/cdk.out/ApiStack.template.json is the synthesised template.
+                # cdk.out/ApiStack.template.json is the synthesised template.
                 # BuildArtifact::path syntax tells CodePipeline where to find it.
-                TemplatePath: "BuildArtifact::infra/cdk.out/ApiStack.template.json"
+                TemplatePath: "BuildArtifact::cdk.out/ApiStack.template.json"
                 # Pass function name so test and prod stacks share the same name
                 ParameterOverrides: !Sub |
                   {

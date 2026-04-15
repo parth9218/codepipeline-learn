@@ -49,10 +49,10 @@ phases:
       - ls -la app/dist/
 
       # Run synth normally (outputs to infra/cdk.out by default).
-      # We explicitely pass -o cdk.out to force directory creation,
-      # since CI environments sometimes default to stdout only.
-      - cd infra && npx cdk synth --context stackName=hello-api-stack -o cdk.out
-      - ls -la infra/cdk.out/
+      # Output the synthesized template directly to the root source directory.
+      # Using an absolute path eliminates any subtle path resolution issues.
+      - cd infra && npm run synth -- --context stackName=hello-api-stack -o $CODEBUILD_SRC_DIR/cdk.out
+      - cd $CODEBUILD_SRC_DIR && ls -la cdk.out/
 
   post_build:
     commands:
