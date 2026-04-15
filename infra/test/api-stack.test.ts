@@ -75,19 +75,19 @@ describe('ApiStack', () => {
   });
 
   // ── CloudFormation Outputs ───────────────────────────────────────────────────
-  test('stack exports ApiUrl output', () => {
-    template.hasOutput('ApiUrl', {});
+  test('stack exports ApiUrlOut output', () => {
+    template.hasOutput('ApiUrlOut', {});
   });
 
-  test('stack exports FunctionName output', () => {
-    template.hasOutput('FunctionName', {});
+  test('stack exports FunctionNameOut output', () => {
+    template.hasOutput('FunctionNameOut', {});
   });
 
-  test('stack exports AliasArn output', () => {
-    template.hasOutput('AliasArn', {});
+  test('stack exports AliasArnOut output', () => {
+    template.hasOutput('AliasArnOut', {});
   });
 
-  test('stack exports VersionArn output', () => {
-    template.hasOutput('VersionArn', {});
+  test('stack exports VersionArnOut output', () => {
+    template.hasOutput('VersionArnOut', {});
   });
 });

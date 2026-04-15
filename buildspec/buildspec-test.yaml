@@ -65,7 +65,7 @@ phases:
       - |
         API_URL=$(aws cloudformation describe-stacks \
           --stack-name "$TEST_STACK_NAME" \
-          --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
+          --query 'Stacks[0].Outputs[?OutputKey==`ApiUrlOut`].OutputValue' \
           --output text)
         echo "API URL: $API_URL"
         echo "API_URL=$API_URL" >> /tmp/test_env

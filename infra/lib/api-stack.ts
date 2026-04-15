@@ -88,29 +88,33 @@ export class ApiStack extends cdk.Stack {
     api.root.addResource('health').addMethod('GET', integration);
 
     // ── Stack Outputs ──────────────────────────────────────────────────────────
-    // These outputs are queried by the buildspecs to construct the appspec.yaml
-    // and run integration tests.
+    // Queried by the test buildspec for integration tests and by the
+    // CloudFormation deploy action to surface the live API URL.
+    // NOTE: Output construct IDs use the 'Out' suffix to avoid collision
+    // with the 'FunctionName' CfnParameter construct in the same scope.
 
-    new cdk.CfnOutput(this, 'ApiUrl', {
+    new cdk.CfnOutput(this, 'ApiUrlOut', {
       value: api.url,
-      description: 'API Gateway base URL (e.g. https://<id>.execute-api.<region>.amazonaws.com/prod/)',
+      description: 'API Gateway base URL',
+      exportName: 'ApiUrl',
     });
 
-    new cdk.CfnOutput(this, 'FunctionName', {
+    new cdk.CfnOutput(this, 'FunctionNameOut', {
       value: fn.functionName,
-      description: 'Lambda function name — used by CodeDeploy to identify the function',
+      description: 'Lambda function name',
+      exportName: 'FunctionName',
     });
 
-    new cdk.CfnOutput(this, 'AliasArn', {
+    new cdk.CfnOutput(this, 'AliasArnOut', {
       value: alias.functionArn,
       description: 'Lambda alias ARN — stable ARN called by API Gateway',
+      exportName: 'AliasArn',
     });
 
-    // VersionArn is the TARGET for the CodeDeploy traffic shift.
-    // The pre-deploy buildspec reads this output after CFN converges.
-    new cdk.CfnOutput(this, 'VersionArn', {
+    new cdk.CfnOutput(this, 'VersionArnOut', {
       value: version.functionArn,
-      description: 'New Lambda version ARN — CodeDeploy shifts traffic to this version',
+      description: 'Current Lambda version ARN',
+      exportName: 'VersionArn',
     });
   }
 }
