@@ -48,16 +48,11 @@ phases:
       - npm run build --prefix app
       - ls -la app/dist/
 
-      - echo "──────────────────────────────────────────────────"
-      - echo "  Step 2 — CDK Synth → cdk.out/"
-      - echo "──────────────────────────────────────────────────"
-      # Run synth normally (outputs to infra/cdk.out) and don't use --quiet
-      # so any errors or warnings are visible in the CodeBuild logs.
-      # Then securely move the output directory to the repo root where 
-      # the pipeline artifact expects to find it.
+      # Run synth normally (outputs to infra/cdk.out by default).
+      # We no longer try to move it; instead we update the pipeline 
+      # Deploy action to read the template directly from infra/cdk.out/
       - cd infra && npx cdk synth --context stackName=hello-api-stack
-      - mv infra/cdk.out ./cdk.out
-      - ls -la cdk.out/
+      - ls -la infra/cdk.out/
 
   post_build:
     commands:

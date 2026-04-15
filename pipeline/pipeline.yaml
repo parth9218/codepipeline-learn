@@ -465,8 +465,6 @@ Resources:
                 BranchName: !Ref GitHubBranch
                 # CODE_ZIP preserves file permissions (important for shell scripts)
                 OutputArtifactFormat: CODE_ZIP
-                # DetectChanges is a V1-only setting; trigger is handled above
-                DetectChanges: false
               OutputArtifacts:
                 - Name: SourceArtifact
 
@@ -540,9 +538,9 @@ Resources:
                 ActionMode: CHANGE_SET_REPLACE
                 StackName: !Ref ProdStackName
                 ChangeSetName: !Sub "${ProdStackName}-changeset"
-                # cdk.out/ApiStack.template.json is the synthesised template.
+                # infra/cdk.out/ApiStack.template.json is the synthesised template.
                 # BuildArtifact::path syntax tells CodePipeline where to find it.
-                TemplatePath: "BuildArtifact::cdk.out/ApiStack.template.json"
+                TemplatePath: "BuildArtifact::infra/cdk.out/ApiStack.template.json"
                 # Pass function name so test and prod stacks share the same name
                 ParameterOverrides: !Sub |
                   {
