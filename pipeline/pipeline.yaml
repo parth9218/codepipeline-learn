@@ -164,7 +164,14 @@ Resources:
                   - apigateway:OPTIONS
                 Resource: !Sub "arn:aws:apigateway:${AWS::Region}::/*"
 
-              # S3 — CloudFormation reads the Lambda asset ZIP from the artifact bucket and CDK asset bucket
+              # S3 — CloudFormation needs ListBucket on the bucket, and GetObject on the objects
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "arn:aws:s3:::cdk-*-assets-${AWS::AccountId}-${AWS::Region}"
               - Effect: Allow
                 Action:
                   - s3:GetObject
