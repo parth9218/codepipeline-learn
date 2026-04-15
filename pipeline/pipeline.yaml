@@ -425,16 +425,31 @@ Resources:
     Properties:
       Name: !Sub "${AWS::StackName}-pipeline"
       RoleArn: !GetAtt PipelineRole.Arn
+      # V2 pipelines use an explicit Triggers block for source detection.
+      # V1 used DetectChanges in the Source action config — that is ignored on V2.
+      PipelineType: V2
       ArtifactStore:
         Type: S3
         Location: !Ref ArtifactBucket
       RestartExecutionOnUpdate: false
 
+      # ── Trigger: fire on every push to the configured branch ────────────────
+      # This replaces the V1 DetectChanges:true Source action config.
+      # CodePipeline registers a GitHub webhook via the CodeStar Connection
+      # and starts a new execution whenever a push matches this filter.
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: GitHubSource
+            Push:
+              - Branches:
+                  Includes:
+                    - !Ref GitHubBranch
+
       Stages:
 
         # ── Stage 1: SOURCE ──────────────────────────────────────────────────
-        # Triggers on every push to the configured branch.
-        # Downloads the repo ZIP and exposes it as SourceArtifact.
+        # Downloads the repo ZIP on every push matched by the Trigger above.
         # ---------------------------------------------------------------------
         - Name: Source
           Actions:
@@ -450,7 +465,8 @@ Resources:
                 BranchName: !Ref GitHubBranch
                 # CODE_ZIP preserves file permissions (important for shell scripts)
                 OutputArtifactFormat: CODE_ZIP
-                DetectChanges: true
+                # DetectChanges is a V1-only setting; trigger is handled above
+                DetectChanges: false
               OutputArtifacts:
                 - Name: SourceArtifact
 
