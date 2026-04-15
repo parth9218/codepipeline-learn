@@ -483,6 +483,7 @@ Resources:
                 ConnectionArn: !Ref GitHubConnection
                 FullRepositoryId: !Sub "${GitHubOwner}/${GitHubRepo}"
                 BranchName: !Ref GitHubBranch
+                DetectChanges: false
                 # CODE_ZIP preserves file permissions (important for shell scripts)
                 OutputArtifactFormat: CODE_ZIP
               OutputArtifacts:
