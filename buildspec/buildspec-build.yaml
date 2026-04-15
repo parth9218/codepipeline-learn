@@ -49,9 +49,9 @@ phases:
       - ls -la app/dist/
 
       # Run synth normally (outputs to infra/cdk.out by default).
-      # We no longer try to move it; instead we update the pipeline 
-      # Deploy action to read the template directly from infra/cdk.out/
-      - cd infra && npx cdk synth --context stackName=hello-api-stack
+      # We explicitely pass -o cdk.out to force directory creation,
+      # since CI environments sometimes default to stdout only.
+      - cd infra && npx cdk synth --context stackName=hello-api-stack -o cdk.out
       - ls -la infra/cdk.out/
 
   post_build:
